@@ -74,7 +74,9 @@ async def input_city(message: types.Message):
 async def send_input_city(message: types.Message):
     if in_input_city:
         async with aiohttp.ClientSession() as session:
+            id_user = message.from_user.id
             city_user = message.text
+            time = datetime.datetime.now().isoformat()
             my_params = {'name': city_user, 'language': 'ru', 'format': 'json'}
             async with session.get(WEATHER_KEY2, params=my_params) as response:
                 if response.status == 200:
@@ -82,6 +84,11 @@ async def send_input_city(message: types.Message):
                     first_element = my_data['results'][0]
                     my_params = {'latitude': first_element['latitude'], 'longitude': first_element['longitude'], 'timezone': 'auto',
                                  'hourly': 'temperature_2m'}
+
+                    async with aiosqlite.connect(DB_NAME) as db:
+                        await db.execute('INSERT INTO users(user_id, latitude_db, longitude_db, time_db, cities_db) VALUES(?,?,?,?,?)', (id_user, first_element['latitude'], first_element['longitude'], time, first_element['name']))
+                        await db.commit()
+
                     async with session.get(WEATHER_KEY, params=my_params) as response:
                         if response.status == 200:
                             my_data2 = await response.json()
