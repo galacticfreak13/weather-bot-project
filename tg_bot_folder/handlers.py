@@ -1,5 +1,7 @@
 from aiogram.filters.command import Command
 from aiogram import Router, types, F
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 WEATHER_KEY = 'https://api.open-meteo.com/v1/forecast'
 WEATHER_KEY2 = 'https://geocoding-api.open-meteo.com/v1/search'
 DB_NAME = 'recent_cities.sql'
@@ -14,6 +16,9 @@ import datetime
 
 router = Router()
 in_input_city = False
+
+class FutureDaysStates(StatesGroup):
+    waiting_geoposition = State()
 
 async def cmd_start(message: types.Message):
     await message.answer(f"Привет {message.from_user.first_name}! Я бот о погоде. Отправь мне свой город и я покажу погоду.", reply_markup=keybord.main)
@@ -32,7 +37,7 @@ async def city_by_coordinats(message: types.Message):
                 city = city.strip()
                 return city
             else:
-                print(f'api error: {response.status}')
+                return 'api error: {response.status}'
 
 
 
@@ -48,8 +53,6 @@ async def check_coordinats(message: types.Message):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute('INSERT INTO users (user_id, latitude_db, longitude_db, time_db, cities_db) VALUES(?,?,?,?,?)', (user_id, my_latitude, my_longitude, time, city))
         await db.commit()
-
-
 
     async with aiohttp.ClientSession() as session:
         my_params = {'latitude': my_latitude, 'longitude': my_longitude, 'timezone': 'auto', 'hourly': 'temperature_2m'}
@@ -115,12 +118,15 @@ async def get_recent_coordinats(message: types.Message):
         if results:
             text = ''
             for lat, lon, time, city in results:
+
                 normal_time_text = (f'Время: {time[11:13]}:{time[14:16]} \n'
                                     f'День: {time[8:10]}-{time[5:7]}-{time[:4]}\n\n')
+
                 text_coordinats = f'Широта: {lat} Долгота: {lon}\n'
                 text_cities = f'Город: {city}\n'
                 text += text_coordinats + text_cities + normal_time_text
-            await message.answer(f'{text}\n Чтобы очистить историю, напишите /clear')
+
+            await message.answer(f'{text}\n /clear - очистка истории.')
 
         else:
             await message.answer('Вы еще не отправляли геопозицию')
@@ -128,12 +134,94 @@ async def get_recent_coordinats(message: types.Message):
 async def cmd_clear(message: types.Message):
     async with aiosqlite.connect(DB_NAME) as db:
         user_id = message.from_user.id
-        cursor = await db.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
+        await db.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
         await db.commit()
     await message.answer('История очищена!')
 
+async def future_days_menu(message: types.Message):
+    await message.answer('Выберите количество дней.', reply_markup=keybord.choice_days_buttons)
+
+async def return_to_main(message: types.Message):
+    await message.answer('Возращаемся в главное меню.', reply_markup=keybord.main)
+
+async def on_3days(message: types.Message, state: FSMContext):
+    await state.set_state(FutureDaysStates.waiting_geoposition)
+    await state.update_data(days=3)
+    await message.answer('Введите название города или сбросьте геопозицию.')
+
+async def on_7days(message: types.Message, state: FSMContext):
+    await state.set_state(FutureDaysStates.waiting_geoposition)
+    await state.update_data(days=7)
+    await message.answer('Введите название города или сбросьте геопозицию.')
+
+async def reg_on_geo(message: types.Message, state: FSMContext):
+
+    my_latitude = message.location.latitude
+    my_longitude = message.location.longitude
+    city = await city_by_coordinats(message)
+    state_data = await state.get_data()
+    days = state_data.get('days')
+    async with aiohttp.ClientSession() as session:
+        my_params = {'latitude': my_latitude, 'longitude': my_longitude, 'timezone': 'auto', 'hourly': 'temperature_2m', 'forecast_days': days}
+        async with session.get(WEATHER_KEY, params=my_params) as response:
+            if response.status == 200:
+                my_data = await response.json()
+                times = my_data['hourly']['time']
+                temperatures = my_data['hourly']['temperature_2m']
+                text = ''
+                count_day = 0
+                for i in range(0, len(times), 24):
+                    count_day += 1
+                    text += (f'{count_day}# Дата: {times[i][8:10]}-{times[i][5:7]}-{times[i][:4]}\n'
+                            f'Температура: {temperatures[i]}°C\n'
+                            f'В городе: {city}\n\n')
+                await message.answer(text)
+            else:
+                await message.answer("Ошибка апи")
+    await state.clear()
+
+async def reg_on_text(message: types.Message, state: FSMContext):
+
+    state_data = await state.get_data()
+    days = state_data.get('days')
+    async with aiohttp.ClientSession() as session:
+        city = message.text
+        my_params = {'name': city, 'language': 'ru', 'format': 'json'}
+        async with session.get(WEATHER_KEY2, params=my_params) as response:
+            if response.status == 200:
+                my_data = await response.json()
+                first_element = my_data['results'][0]
+                my_params2 = {'latitude': first_element['latitude'], 'longitude': first_element['longitude'],'timezone': 'auto','hourly': 'temperature_2m', 'forecast_days':days}
+                async with session.get(WEATHER_KEY, params=my_params2) as response:
+                    if response.status == 200:
+                        my_data = await response.json()
+
+                        times = my_data['hourly']['time']
+                        temperatures = my_data['hourly']['temperature_2m']
+                        text = ''
+                        count_day = 0
+                        for i in range(0, len(times), 24):
+                            count_day += 1
+                            text += (f'{count_day}# Дата: {times[i][8:10]}-{times[i][5:7]}-{times[i][:4]}\n'
+                                     f'Температура: {temperatures[i]}°C\n'
+                                     f'В городе: {city}\n\n')
+                        await message.answer(text)
+                    else:
+                        await message.answer("Ошибка апи")
+    await state.clear()
+
 router.message.register(cmd_start, Command(commands='start'))
 router.message.register(cmd_clear, Command(commands='clear'))
+
+
+router.message.register(future_days_menu, F.text == 'Прогноз на будущие дни.')
+router.message.register(return_to_main, F.text == 'Назад.')
+
+router.message.register(on_3days, F.text == 'На 3 дня.')
+router.message.register(on_7days, F.text == 'На неделю.')
+router.message.register(reg_on_geo, F.location, FutureDaysStates.waiting_geoposition)
+router.message.register(reg_on_text, F.text, FutureDaysStates.waiting_geoposition)
+
 router.message.register(check_coordinats, F.location)
 router.message.register(get_recent_coordinats, F.text == 'Мои последние геопозиции.')
 router.message.register(input_city, F.text=='Погода в введеном городе.')
