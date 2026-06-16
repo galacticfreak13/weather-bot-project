@@ -2,6 +2,7 @@ from aiogram.filters.command import Command
 from aiogram import Router, types, F
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
+from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
 WEATHER_KEY = 'https://api.open-meteo.com/v1/forecast'
 WEATHER_KEY2 = 'https://geocoding-api.open-meteo.com/v1/search'
 DB_NAME = 'recent_cities.sql'
@@ -12,13 +13,25 @@ import aiohttp
 import aiosqlite
 import datetime
 
-
+weather_dictionary = {
+    (0,1,2): '☀️ Ясно',
+    (3,): '☁️ Пасмурно',
+    (45,51,53,55): '🌫️ Туман',
+    (61,63): '🌧️ Слабый дождь',
+    (65,): '🌧️ Сильный дождь',
+    (71,73): '🌨️ Слабый снег',
+    (75,): '🌨️ Сильный снег',
+    (80,81,82): 'Ливень',
+    (95,): '⛈️ Гроза',
+    (96,99): '⛈️ Гроза с градом',
+}
 
 router = Router()
 in_input_city = False
 
 class FutureDaysStates(StatesGroup):
     waiting_geoposition = State()
+    waiting_date = State()
 
 async def cmd_start(message: types.Message):
     await message.answer(f"Привет {message.from_user.first_name}! Я бот о погоде. Отправь мне свой город и я покажу погоду.", reply_markup=keybord.main)
@@ -40,7 +53,6 @@ async def city_by_coordinats(message: types.Message):
                 return 'api error: {response.status}'
 
 
-
 async def check_coordinats(message: types.Message):
     global in_input_city
     in_input_city = False
@@ -55,15 +67,24 @@ async def check_coordinats(message: types.Message):
         await db.commit()
 
     async with aiohttp.ClientSession() as session:
-        my_params = {'latitude': my_latitude, 'longitude': my_longitude, 'timezone': 'auto', 'hourly': 'temperature_2m'}
+        my_params = {'latitude': my_latitude, 'longitude': my_longitude, 'timezone': 'auto', 'hourly': 'temperature_2m,weather_code'}
 
         async with session.get(WEATHER_KEY, params=my_params) as response:
             if response.status == 200:
                 my_data = await response.json()
+                my_code_weather = my_data['hourly']['weather_code'][0]
                 current_temp = my_data['hourly']['temperature_2m'][0]
+
+                for codes, states in weather_dictionary.items():
+                    if my_code_weather in codes:
+                        state = states
+                        break
+                    else:
+                        state = 'Нет состояния'
 
                 await message.answer(f'Температура сейчас: {current_temp}°C \n' 
                                      f'На координаты: {my_latitude}, {my_longitude}\n'
+                                     f'Состояние: {state}\n'
                                      f'В городе: {city}')
             else:
                 await message.answer('Что то не так')
@@ -86,7 +107,7 @@ async def send_input_city(message: types.Message):
                     my_data = await response.json()
                     first_element = my_data['results'][0]
                     my_params = {'latitude': first_element['latitude'], 'longitude': first_element['longitude'], 'timezone': 'auto',
-                                 'hourly': 'temperature_2m'}
+                                 'hourly': 'temperature_2m,weather_code'}
 
                     async with aiosqlite.connect(DB_NAME) as db:
                         await db.execute('INSERT INTO users(user_id, latitude_db, longitude_db, time_db, cities_db) VALUES(?,?,?,?,?)', (id_user, first_element['latitude'], first_element['longitude'], time, first_element['name']))
@@ -96,9 +117,18 @@ async def send_input_city(message: types.Message):
                         if response.status == 200:
                             my_data2 = await response.json()
                             current_temp = my_data2['hourly']['temperature_2m'][0]
-                            print(my_data2)
+                            my_code_weather = my_data2['hourly']['weather_code'][0]
+
+                            for codes, states in weather_dictionary.items():
+                                if my_code_weather in codes:
+                                    state = states
+                                    break
+                                else:
+                                    state = 'Нет состояния'
+
                             await message.answer(f'Температура сейчас: {current_temp}°C \n'
                                                  f'На координаты: {first_element['latitude']}, {first_element['longitude']}\n'
+                                                 f'Состояние: {state}\n'
                                                  f'В городе: {first_element['name']}')
                         else:
                             print(f'api error: {response.status}')
@@ -154,6 +184,34 @@ async def on_7days(message: types.Message, state: FSMContext):
     await state.update_data(days=7)
     await message.answer('Введите название города или сбросьте геопозицию.')
 
+async def create_calendar(message: types.Message, state: FSMContext):
+    await state.set_state(FutureDaysStates.waiting_date)
+    today = datetime.datetime.now().date()
+
+    calendar = SimpleCalendar(locale='ru_RU')
+    await message.answer('Выберите дату:\n'
+                         '(Максимум 16 дней, минимум сегодняшний день).',
+                         reply_markup=await calendar.start_calendar())
+
+async def on_special_day(callback: types.CallbackQuery, callback_data: SimpleCalendarCallback, state: FSMContext):
+    calendar = SimpleCalendar(locale='ru_RU')
+    selected, selected_date = await calendar.process_selection(callback, callback_data)
+
+    if selected:
+        today = datetime.datetime.now().date()
+        max_day = today + datetime.timedelta(days=15)
+
+        if selected_date.date() < today or selected_date.date() > max_day:
+            await callback.message.delete()
+            await callback.message.answer('Можно выбрать только текущую дату и на 16 дней вперед.')
+        else:
+            text = selected_date.strftime('%Y-%m-%d')
+            await state.set_state(FutureDaysStates.waiting_geoposition)
+            await state.update_data(days=text)
+            await callback.message.delete()
+            await callback.message.answer(f'Введите город или сбросьте геопозицию, чтобы узнать погоду на {text}')
+
+
 async def reg_on_geo(message: types.Message, state: FSMContext):
 
     my_latitude = message.location.latitude
@@ -162,7 +220,11 @@ async def reg_on_geo(message: types.Message, state: FSMContext):
     state_data = await state.get_data()
     days = state_data.get('days')
     async with aiohttp.ClientSession() as session:
-        my_params = {'latitude': my_latitude, 'longitude': my_longitude, 'timezone': 'auto', 'hourly': 'temperature_2m', 'forecast_days': days}
+        if str(days).isdigit():
+            my_params = {'latitude': my_latitude, 'longitude': my_longitude, 'timezone': 'auto',
+                         'hourly': 'temperature_2m,weather_code', 'forecast_days': days}
+        else:
+            my_params = {'latitude': my_latitude, 'longitude': my_longitude, 'timezone': 'auto', 'hourly': 'temperature_2m', 'start_date': days, 'end_date': days}
         async with session.get(WEATHER_KEY, params=my_params) as response:
             if response.status == 200:
                 my_data = await response.json()
@@ -191,7 +253,12 @@ async def reg_on_text(message: types.Message, state: FSMContext):
             if response.status == 200:
                 my_data = await response.json()
                 first_element = my_data['results'][0]
-                my_params2 = {'latitude': first_element['latitude'], 'longitude': first_element['longitude'],'timezone': 'auto','hourly': 'temperature_2m', 'forecast_days':days}
+                if str(days).isdigit():
+                    my_params2 = {'latitude': first_element['latitude'], 'longitude': first_element['longitude'],'timezone': 'auto','hourly': 'temperature_2m', 'forecast_days':days}
+                else:
+                    my_params2 = {'latitude': first_element['latitude'], 'longitude': first_element['longitude'], 'timezone': 'auto',
+                                 'hourly': 'temperature_2m', 'start_date': days, 'end_date': days}
+
                 async with session.get(WEATHER_KEY, params=my_params2) as response:
                     if response.status == 200:
                         my_data = await response.json()
@@ -219,6 +286,9 @@ router.message.register(return_to_main, F.text == 'Назад.')
 
 router.message.register(on_3days, F.text == 'На 3 дня.')
 router.message.register(on_7days, F.text == 'На неделю.')
+router.message.register(create_calendar, F.text == 'На определенную дату.')
+router.callback_query.register(on_special_day, SimpleCalendarCallback.filter())
+
 router.message.register(reg_on_geo, F.location, FutureDaysStates.waiting_geoposition)
 router.message.register(reg_on_text, F.text, FutureDaysStates.waiting_geoposition)
 
